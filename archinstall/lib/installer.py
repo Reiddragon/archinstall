@@ -1,4 +1,4 @@
-import os, stat, time
+import os, stat, time, shutil
 
 from .exceptions import *
 from .disk import *
@@ -34,12 +34,17 @@ class Installer():
 	:type hostname: str, optional
 
 	"""
-	def __init__(self, partition, boot_partition, *, base_packages='base base-devel linux linux-firmware efibootmgr nano', profile=None, mountpoint='/mnt', hostname='ArchInstalled'):
+	def __init__(self, partition, boot_partition, *, base_packages='base base-devel linux linux-firmware efibootmgr nano', profile=None, mountpoint='/mnt', hostname='ArchInstalled', logdir=None, logfile=None):
 		self.profile = profile
 		self.hostname = hostname
 		self.mountpoint = mountpoint
 		self.init_time = time.strftime('%Y-%m-%d_%H-%M-%S')
 		self.milliseconds = int(str(time.time()).split('.')[1])
+
+		if logdir:
+			storage['LOG_PATH'] = logdir
+		if logfile:
+			storage['LOG_FILE'] = logfile
 
 		self.helper_flags = {
 			'bootloader' : False,
@@ -48,23 +53,18 @@ class Installer():
 		}
 
 		self.base_packages = base_packages.split(' ')
+		self.post_base_install = []
 		storage['session'] = self
 
 		self.partition = partition
 		self.boot_partition = boot_partition
 
-	def log(self, *args, level=LOG_LEVELS.Debug, file=None, **kwargs):
-		if not file:
-			if 'logfile' not in storage:
-				log_root = os.path.join(os.path.expanduser('~/'), '.cache/archinstall')
-				if not os.path.isdir(log_root):
-					os.makedirs(log_root)
-
-				storage['logfile'] = f"{log_root}/install-session_{self.init_time}.{self.milliseconds}.log"
-
-			file = storage['logfile']
-
-		log(*args, level=level, file=file, **kwargs)
+	def log(self, *args, level=LOG_LEVELS.Debug, **kwargs):
+		"""
+		installer.log() wraps output.log() mainly to set a default log-level for this install session.
+		Any manual override can be done per log() call.
+		"""
+		log(*args, level=level, **kwargs)
 
 	def __enter__(self, *args, **kwargs):
 		self.partition.mount(self.mountpoint)
@@ -75,13 +75,24 @@ class Installer():
 	def __exit__(self, *args, **kwargs):
 		# b''.join(sys_command(f'sync')) # No need to, since the underlaying fs() object will call sync.
 		# TODO: https://stackoverflow.com/questions/28157929/how-to-safely-handle-an-exception-inside-a-context-manager
+
 		if len(args) >= 2 and args[1]:
+			#self.log(self.trace_log.decode('UTF-8'), level=LOG_LEVELS.Debug)
+			self.log(args[1], level=LOG_LEVELS.Error)
+
+			self.sync_log_to_install_medium()
+
+			# We avoid printing /mnt/<log path> because that might confuse people if they note it down
+			# and then reboot, and a identical log file will be found in the ISO medium anyway.
+			print(f"[!] A log file has been created here: {os.path.join(storage['LOG_PATH'], storage['LOG_FILE'])}")
+			print(f"    Please submit this issue (and file) to https://github.com/Torxed/archinstall/issues")
 			raise args[1]
 
 		self.genfstab()
 
 		if not (missing_steps := self.post_install_check()):
 			self.log('Installation completed without any errors. You may now reboot.', bg='black', fg='green', level=LOG_LEVELS.Info)
+			self.sync_log_to_install_medium()
 			return True
 		else:
 			self.log('Some required steps were not successfully installed/configured before leaving the installer:', bg='black', fg='red', level=LOG_LEVELS.Warning)
@@ -89,7 +100,22 @@ class Installer():
 				self.log(f' - {step}', bg='black', fg='red', level=LOG_LEVELS.Warning)
 			self.log(f"Detailed error logs can be found at: {log_path}", level=LOG_LEVELS.Warning)
 			self.log(f"Submit this zip file as an issue to https://github.com/Torxed/archinstall/issues", level=LOG_LEVELS.Warning)
+			self.sync_log_to_install_medium()
 			return False
+
+	def sync_log_to_install_medium(self):
+		# Copy over the install log (if there is one) to the install medium if
+		# at least the base has been strapped in, otherwise we won't have a filesystem/structure to copy to.
+		if self.helper_flags.get('base-strapped', False) is True:
+			if (filename := storage.get('LOG_FILE', None)):
+				absolute_logfile = os.path.join(storage.get('LOG_PATH', './'), filename)
+
+				if not os.path.isdir(f"{self.mountpoint}/{os.path.dirname(absolute_logfile)}"):
+					os.makedirs(f"{self.mountpoint}/{os.path.dirname(absolute_logfile)}")
+				
+				shutil.copy2(absolute_logfile, f"{self.mountpoint}/{absolute_logfile}")
+
+		return True
 
 	def mount(self, partition, mountpoint, create_mountpoint=True):
 		if create_mountpoint and not os.path.isdir(f'{self.mountpoint}{mountpoint}'):
@@ -182,6 +208,56 @@ class Installer():
 		with open(f"{self.mountpoint}/etc/systemd/network/10-{nic}.network", "a") as netconf:
 			netconf.write(str(conf))
 
+	def copy_ISO_network_config(self, enable_services=False):
+		# Copy (if any) iwd password and config files
+		if os.path.isdir('/var/lib/iwd/'):
+			if (psk_files := glob.glob('/var/lib/iwd/*.psk')):
+				if not os.path.isdir(f"{self.mountpoint}/var/lib/iwd"):
+					os.makedirs(f"{self.mountpoint}/var/lib/iwd")
+
+				if enable_services:
+					# If we haven't installed the base yet (function called pre-maturely)
+					if self.helper_flags.get('base', False) is False:
+						self.base_packages.append('iwd')
+						# This function will be called after minimal_installation() 
+						# as a hook for post-installs. This hook is only needed if
+						# base is not installed yet.
+						def post_install_enable_iwd_service(*args, **kwargs):
+							self.enable_service('iwd')
+
+						self.post_base_install.append(post_install_enable_iwd_service)
+					# Otherwise, we can go ahead and add the required package
+					# and enable it's service:
+					else:
+						self.pacstrap('iwd')
+						self.enable_service('iwd')
+
+				for psk in psk_files:
+					shutil.copy2(psk, f"{self.mountpoint}/var/lib/iwd/{os.path.basename(psk)}")
+
+		# Copy (if any) systemd-networkd config files
+		if (netconfigurations := glob.glob('/etc/systemd/network/*')):
+			if not os.path.isdir(f"{self.mountpoint}/etc/systemd/network/"):
+				os.makedirs(f"{self.mountpoint}/etc/systemd/network/")
+
+			for netconf_file in netconfigurations:
+				shutil.copy2(netconf_file, f"{self.mountpoint}/etc/systemd/network/{os.path.basename(netconf_file)}")
+
+			if enable_services:
+				# If we haven't installed the base yet (function called pre-maturely)
+				if self.helper_flags.get('base', False) is False:
+					def post_install_enable_networkd_resolved(*args, **kwargs):
+						self.enable_service('systemd-networkd')
+						self.enable_service('systemd-resolved')
+
+					self.post_base_install.append(post_install_enable_networkd_resolved)
+				# Otherwise, we can go ahead and enable the services
+				else:
+					self.enable_service('systemd-networkd')
+					self.enable_service('systemd-resolved')
+
+		return True
+
 	def minimal_installation(self):
 		## Add nessecary packages if encrypting the drive
 		## (encrypted partitions default to btrfs for now, so we need btrfs-progs)
@@ -195,6 +271,7 @@ class Installer():
 		if self.partition.filesystem == 'f2fs':
 			self.base_packages.append('f2fs-tools')
 		self.pacstrap(self.base_packages)
+		self.helper_flags['base-strapped'] = True
 		#self.genfstab()
 
 		with open(f"{self.mountpoint}/etc/fstab", "a") as fstab:
@@ -207,7 +284,7 @@ class Installer():
 		#sys_command(f'/usr/bin/arch-chroot {self.mountpoint} ln -s /usr/share/zoneinfo/{localtime} /etc/localtime')
 		#sys_command('/usr/bin/arch-chroot /mnt hwclock --hctosys --localtime')
 		self.set_hostname()
-		self.set_locale('en_US.UTF-8')
+		self.set_locale('en_US')
 
 		# TODO: Use python functions for this
 		sys_command(f'/usr/bin/arch-chroot {self.mountpoint} chmod 700 /root')
@@ -222,6 +299,12 @@ class Installer():
 			sys_command(f'/usr/bin/arch-chroot {self.mountpoint} mkinitcpio -p linux')
 
 		self.helper_flags['base'] = True
+
+		# Run registered post-install hooks
+		for function in self.post_base_install:
+			self.log(f"Running post-installation hook: {function}", level=LOG_LEVELS.Info)
+			function(self)
+
 		return True
 
 	def add_bootloader(self, bootloader='systemd-bootctl'):

@@ -1,15 +1,10 @@
 import getpass, time, json, sys, signal, os
 import archinstall
 
-# Setup a global log file.
-# Archinstall will honor storage['logfile'] in most of it's functions log handle.
-log_root = os.path.join(os.path.expanduser('~/'), '.cache/archinstall')
-if not os.path.isdir(log_root):
-	os.makedirs(log_root)
-
-init_time = time.strftime('%Y-%m-%d_%H-%M-%S')
-milliseconds = int(str(time.time()).split('.')[1])
-archinstall.storage['logfile'] = f"{log_root}/install-session_{init_time}.{milliseconds}.log"
+# Create a storage structure for all our information.
+# We'll print this right before the user gets informed about the formatting timer.
+archinstall.storage['_guided'] = {}
+archinstall.storage['_guided_hidden'] = {} # This will simply be hidden from printouts and things.
 
 """
 This signal-handler chain (and global variable)
@@ -49,10 +44,17 @@ def perform_installation(device, boot_partition, language, mirrors):
 			installation.set_keyboard_language(language)
 			installation.add_bootloader()
 
-			if archinstall.storage['_guided']['network']:
+			# If user selected to copy the current ISO network configuration
+			# Perform a copy of the config
+			if archinstall.storage['_guided']['network'] == 'Copy ISO network configuration to installation':
+				installation.copy_ISO_network_config(enable_services=True) # Sources the ISO network configuration to the install medium.
+
+			# Otherwise, if a interface was selected, configure that interface
+			elif archinstall.storage['_guided']['network']:
 				installation.configure_nic(**archinstall.storage['_guided']['network'])
 				installation.enable_service('systemd-networkd')
 				installation.enable_service('systemd-resolved')
+
 
 			if archinstall.storage['_guided']['packages'] and archinstall.storage['_guided']['packages'][0] != '':
 				installation.add_additional_packages(archinstall.storage['_guided']['packages'])
@@ -77,6 +79,7 @@ def perform_installation(device, boot_partition, language, mirrors):
 archinstall.sys_command(f'umount -R /mnt', suppress_errors=True)
 archinstall.sys_command(f'cryptsetup close /dev/mapper/luksloop', suppress_errors=True)
 
+
 """
   First, we'll ask the user for a bunch of user input.
   Not until we're satisfied with what we want to install
@@ -85,11 +88,7 @@ archinstall.sys_command(f'cryptsetup close /dev/mapper/luksloop', suppress_error
 
 if len(keyboard_language := archinstall.select_language(archinstall.list_keyboard_languages()).strip()):
 	archinstall.set_keyboard_language(keyboard_language)
-
-# Create a storage structure for all our information.
-# We'll print this right before the user gets informed about the formatting timer.
-archinstall.storage['_guided'] = {}
-archinstall.storage['_guided_hidden'] = {} # This will simply be hidden from printouts and things.
+	archinstall.storage['_guided']['keyboard_layout'] = keyboard_language
 
 # Set which region to download packages from during the installation
 mirror_regions = archinstall.select_mirror_regions(archinstall.list_mirrors())
@@ -102,6 +101,7 @@ while (disk_password := getpass.getpass(prompt='Enter disk encryption password (
 	if disk_password != disk_password_verification:
 		archinstall.log(' * Passwords did not match * ', bg='black', fg='red')
 		continue
+	archinstall.storage['_guided']['disk_encryption'] = True
 	break
 archinstall.storage['_guided']['harddrive'] = harddrive
 
@@ -118,7 +118,10 @@ while (root_pw := getpass.getpass(prompt='Enter root password (leave blank to le
 		archinstall.log(' * Passwords did not match * ', bg='black', fg='red')
 		continue
 
+	# Storing things in _guided_hidden helps us avoid printing it
+	# when echoing user configuration: archinstall.storage['_guided']
 	archinstall.storage['_guided_hidden']['root_pw'] = root_pw
+	archinstall.storage['_guided']['root_unlocked'] = True
 	break
 
 # Ask for additional users (super-user if root pw was not set)
@@ -188,11 +191,12 @@ while 1:
 
 # Optionally configure one network interface.
 #while 1:
-interfaces = archinstall.list_interfaces() # {MAC: Ifname}
+# {MAC: Ifname}
+interfaces = {'ISO-CONFIG' : 'Copy ISO network configuration to installation', **archinstall.list_interfaces()}
 archinstall.storage['_guided']['network'] = None
 
 nic = archinstall.generic_select(interfaces.values(), "Select one network interface to configure (leave blank to skip): ")
-if nic:
+if nic and nic != 'Copy ISO network configuration to installation':
 	mode = archinstall.generic_select(['DHCP (auto detect)', 'IP (static)'], f"Select which mode to configure for {nic}: ")
 	if mode == 'IP (static)':
 		while 1:
@@ -217,7 +221,8 @@ if nic:
 		archinstall.storage['_guided']['network'] = {'nic': nic, 'dhcp': False, 'ip': ip, 'gateway' : gateway, 'dns' : dns}
 	else:
 		archinstall.storage['_guided']['network'] = {'nic': nic}
-
+elif nic:
+	archinstall.storage['_guided']['network'] = nic
 
 print()
 print('This is your chosen configuration:')
